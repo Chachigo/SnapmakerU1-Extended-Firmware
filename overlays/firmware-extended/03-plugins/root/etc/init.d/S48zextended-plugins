@@ -1,0 +1,28 @@
+#!/bin/sh
+
+# Re-apply community plugins into the live rootfs.
+#
+# The rootfs overlay upper is wiped on every boot unless /oem/.debug exists, so
+# the plugin trees kept in /oem/plugins have to be copied back in at each boot.
+#
+# The `z` in the name places this after S48setup-lava-env and before
+# S49extended-config, so a plugin's config defaults land in
+# /usr/local/share/firmware-config/extended/ in time for S49 to copy them into
+# the user's config directory, and before nginx, Moonraker and firmware-config
+# start.
+
+case "$1" in
+    start|restart|reload)
+        printf "Applying plugins: "
+        /usr/local/bin/extended-plugin apply
+        echo "OK"
+        ;;
+    stop)
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+exit 0

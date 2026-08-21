@@ -6,6 +6,13 @@ title: Third-Party Integrations
 
 Third-party integrations in this firmware are handled through an on-demand download system with cryptographic verification.
 
+This document covers third-party *components the firmware itself ships support
+for* — an upstream binary, pinned to a version and a checksum chosen at build
+time, downloaded on demand by `extended-pkg`. Third-party *features written by
+users*, which the firmware knows nothing about until someone installs one, are
+a separate mechanism: see [Plugins](../plugins.md). The distinction is who
+picks the version — the firmware, or the user.
+
 ## Design Principles
 
 External components that are non-essential to core printer operations and of significant size are not bundled with the firmware image. Instead, they are:

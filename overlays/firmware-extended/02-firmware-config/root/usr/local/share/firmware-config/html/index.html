@@ -58,6 +58,18 @@
         .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #555; border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; }
         @keyframes spin { to { transform: rotate(360deg); } }
         .loading { color: var(--muted); font-size: 13px; padding: 12px; text-align: center; }
+        .plugin-warning { background: var(--item); border-left: 3px solid var(--warning); border-radius: 4px; padding: 10px 12px; margin-bottom: 12px; font-size: 12px; color: var(--muted); }
+        .plugin-warning a { color: var(--accent); }
+        .plugin { display: flex; align-items: center; gap: 12px; background: var(--item); border-radius: 6px; padding: 12px; margin-bottom: 8px; }
+        .plugin-info { flex: 1; min-width: 0; }
+        .plugin-name { font-weight: 600; color: #fff; }
+        .plugin-meta { font-size: 12px; color: var(--muted); margin-top: 2px; word-break: break-word; }
+        .plugin-state { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; background: #555; color: var(--text); }
+        .plugin-state.enabled { background: var(--success); color: #000; }
+        .plugin-state.error { background: var(--error); color: #000; }
+        .plugin-page { color: var(--accent); text-decoration: none; font-size: 15px; margin-left: 2px; }
+        .plugin-page:hover { text-decoration: none; opacity: 0.75; }
+        .plugin-actions { display: flex; gap: 8px; flex-shrink: 0; }
         .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 1000; align-items: center; justify-content: center; }
         .modal-overlay.visible { display: flex; }
         .modal { background: var(--card); border-radius: 12px; padding: 24px; width: 720px; max-width: 90vw; max-height: 80vh; display: flex; flex-direction: column; overflow-y: auto; }
@@ -116,6 +128,29 @@
         <div class="card">
             <div class="card-header"><span class="card-title">Quick Links</span></div>
             <div id="links-container" class="links-grid"><div class="loading"><span class="spinner"></span> Loading...</div></div>
+        </div>
+
+        <div class="card" id="plugins-card">
+            <div class="card-header"><span class="card-title">Plugins</span></div>
+            <div class="plugin-warning">
+                Community plugins are not reviewed by this project and run as <strong>root</strong>
+                with full access to the printer. Only install plugins from authors you trust.
+                <a href="https://snapmakeru1-extended-firmware.pages.dev/plugins" target="_blank">View docs</a>
+            </div>
+            <div id="plugins-container"><div class="loading"><span class="spinner"></span> Loading...</div></div>
+            <div class="input-row">
+                <input type="text" class="input" id="plugin-url-input" placeholder="Plugin tarball URL" oninput="validatePluginURL()">
+                <button class="btn btn-primary" id="plugin-download-btn" disabled onclick="installPluginFromURL()">Install</button>
+            </div>
+            <div class="separator">OR</div>
+            <div class="input-row file-drop" id="plugin-file-drop">
+                <input type="file" id="plugin-file-input" accept=".gz,.tgz,.tar.gz" onchange="handlePluginFile(this)" style="display:none">
+                <input type="text" class="input" id="plugin-file-display" placeholder="Click to select or drag &amp; drop a .tar.gz" readonly onclick="$('plugin-file-input').click()">
+                <button class="btn btn-warning" id="plugin-upload-btn" disabled onclick="installPluginFromFile()">Upload &amp; Install</button>
+            </div>
+            <div class="input-row">
+                <input type="text" class="input" id="plugin-sha-input" placeholder="Expected SHA256 (optional, but verifies the download)">
+            </div>
         </div>
 
         <div class="card">
@@ -810,6 +845,211 @@
         }
 
         // ========================================
+        // Plugins
+        // ========================================
+
+        let selectedPluginFile = null;
+
+        // plugin.conf is written by a third party, so nothing from it reaches
+        // the DOM as markup.
+        function esc(text) {
+            const div = document.createElement('div');
+            div.textContent = text == null ? '' : String(text);
+            return div.innerHTML;
+        }
+
+        function validatePluginURL() {
+            const url = $('plugin-url-input').value.trim();
+            try {
+                $('plugin-download-btn').disabled = !(url && ['http:', 'https:'].includes(new URL(url).protocol));
+            } catch {
+                $('plugin-download-btn').disabled = true;
+            }
+        }
+
+        function handlePluginFile(input) {
+            if (input.files[0]) selectPluginFile(input.files[0]);
+        }
+
+        function selectPluginFile(file) {
+            selectedPluginFile = file;
+            $('plugin-file-display').value = `${file.name} (${formatSize(file.size)})`;
+            $('plugin-upload-btn').disabled = false;
+        }
+
+        const pluginDrop = $('plugin-file-drop');
+        pluginDrop.ondragover = (e) => { e.preventDefault(); pluginDrop.classList.add('dragover'); };
+        pluginDrop.ondragleave = () => pluginDrop.classList.remove('dragover');
+        pluginDrop.ondrop = (e) => {
+            e.preventDefault();
+            pluginDrop.classList.remove('dragover');
+            if (e.dataTransfer.files[0]) selectPluginFile(e.dataTransfer.files[0]);
+        };
+
+        // The checksum is optional: without it the printer still installs, but
+        // extended-plugin prints the hash instead of verifying one.
+        function pluginShaQuery() {
+            const sha = $('plugin-sha-input').value.trim();
+            return sha ? '?PLUGIN_SHA256=' + encodeURIComponent(sha) : '';
+        }
+
+        async function loadPlugins() {
+            const container = $('plugins-container');
+            try {
+                const resp = await apiFetch('api/plugins');
+                const plugins = await resp.json();
+
+                if (!plugins.length) {
+                    container.innerHTML = '<div class="loading">No plugins installed.</div>';
+                    return;
+                }
+
+                container.innerHTML = plugins.map(p => {
+                    const meta = [p.version, p.author && `by ${p.author}`, p.description]
+                        .filter(Boolean).map(esc).join(' &middot; ');
+                    const homepage = /^https?:\/\//.test(p.url || '')
+                        ? ` <a href="${esc(p.url)}" target="_blank">homepage</a>` : '';
+                    // Only a same-origin path: the page is served by the printer,
+                    // and PLUGIN_PAGE comes from a third-party manifest.
+                    const page = /^\/[^/]/.test(p.page || '')
+                        ? ` <a class="plugin-page" href="${esc(p.page)}" target="_blank"
+                               title="Open ${esc(p.label || p.name)}">&#x2197;</a>` : '';
+                    const toggle = p.state === 'disabled'
+                        ? `<button class="btn btn-secondary" onclick="pluginCommand('${esc(p.name)}', 'enable')">Enable</button>`
+                        : `<button class="btn btn-secondary" onclick="pluginCommand('${esc(p.name)}', 'disable')">Disable</button>`;
+                    return `<div class="plugin">
+                        <div class="plugin-info">
+                            <div class="plugin-name">${esc(p.label || p.name)}${page} <span class="plugin-state ${esc(p.state)}">${esc(p.state)}</span></div>
+                            <div class="plugin-meta">${meta}${homepage}</div>
+                        </div>
+                        <div class="plugin-actions">
+                            ${toggle}
+                            <button class="btn btn-danger" onclick="pluginCommand('${esc(p.name)}', 'remove')">Remove</button>
+                        </div>
+                    </div>`;
+                }).join('');
+            } catch (e) {
+                container.innerHTML = '<div class="loading">Could not load plugins.</div>';
+            }
+        }
+
+        function pluginCommand(name, command) {
+            const run = () => runPluginCommand(name, command);
+            if (command === 'remove') {
+                showConfirmModal('Remove Plugin',
+                    `Remove ${name}? Its files and its default config are deleted. Affected services restart.`,
+                    run);
+            } else {
+                run();
+            }
+        }
+
+        async function runPluginCommand(name, command) {
+            showActionModal(`${command} ${name}`, 'Working...');
+            $('action-log').classList.add('visible');
+            try {
+                const resp = await apiFetch(`api/plugins/${encodeURIComponent(name)}/${command}`, { method: 'POST' });
+                await streamResponse(resp);
+            } catch (e) {
+                appendLog(`\nERROR: ${e.message}`);
+                setMessage('Failed', 'var(--error)');
+            } finally {
+                enableCloseButton();
+                loadPlugins();
+            }
+        }
+
+        function installPluginFromURL() {
+            const url = $('plugin-url-input').value.trim();
+            if (!url) return;
+            showConfirmModal('Install Plugin',
+                'Install this plugin? It runs as root with full access to the printer.',
+                () => doInstallPluginFromURL(url));
+        }
+
+        async function doInstallPluginFromURL(url) {
+            const btn = $('plugin-download-btn');
+            btn.disabled = true;
+            showActionModal('Install Plugin', 'Downloading...');
+            $('action-log').classList.add('visible');
+
+            try {
+                const resp = await apiFetch('api/plugins/install/url' + pluginShaQuery(), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                });
+                await streamResponse(resp);
+            } catch (e) {
+                appendLog(`\nERROR: ${e.message}`);
+                setMessage('Failed', 'var(--error)');
+            } finally {
+                enableCloseButton();
+                btn.disabled = false;
+                loadPlugins();
+            }
+        }
+
+        function installPluginFromFile() {
+            if (!selectedPluginFile) return;
+            showConfirmModal('Install Plugin',
+                'Install this plugin? It runs as root with full access to the printer.',
+                doInstallPluginFromFile);
+        }
+
+        function doInstallPluginFromFile() {
+            if (!selectedPluginFile) return;
+
+            const btn = $('plugin-upload-btn');
+            btn.disabled = true;
+            showActionModal('Install Plugin', 'Uploading...');
+            $('action-log').classList.add('visible');
+            $('action-progress').classList.add('visible');
+
+            const formData = new FormData();
+            formData.append('file', selectedPluginFile);
+
+            const xhr = new XMLHttpRequest();
+            let lastIdx = 0;
+
+            xhr.open('POST', 'api/plugins/install/upload' + pluginShaQuery());
+            const jwt = getJWT();
+            if (jwt) xhr.setRequestHeader('Authorization', `Bearer ${jwt}`);
+
+            xhr.upload.onprogress = (e) => {
+                if (!e.lengthComputable) return;
+                const pct = (e.loaded / e.total) * 100;
+                $('action-progress-fill').style.width = pct.toFixed(1) + '%';
+            };
+            xhr.upload.onload = () => {
+                setMessage('Installing...');
+                $('action-progress').classList.remove('visible');
+            };
+            xhr.onprogress = () => {
+                const newText = xhr.responseText.substring(lastIdx);
+                if (newText) { appendLog(newText); lastIdx = xhr.responseText.length; }
+            };
+            xhr.onload = () => {
+                const newText = xhr.responseText.substring(lastIdx);
+                if (newText) appendLog(newText);
+                const lastLine = (xhr.responseText.trim().split('\n').pop() || '');
+                if (lastLine.startsWith('SUCCESS:')) setMessage('Installed', 'var(--success)');
+                else if (lastLine.startsWith('ERROR:')) setMessage('Install failed', 'var(--error)');
+                enableCloseButton();
+                btn.disabled = false;
+                loadPlugins();
+            };
+            xhr.onerror = () => {
+                appendLog('\nERROR: upload failed');
+                setMessage('Failed', 'var(--error)');
+                enableCloseButton();
+                btn.disabled = false;
+            };
+
+            xhr.send(formData);
+        }
+
+        // ========================================
         // Refresh All
         // ========================================
 
@@ -824,7 +1064,8 @@
                     loadLinks(),
                     loadSettings(),
                     loadActions('quick-actions-container', 'api/quick-actions', 'quick-actions-card'),
-                    loadActions('actions-container', 'api/actions')
+                    loadActions('actions-container', 'api/actions'),
+                    loadPlugins()
                 ]);
             } finally {
                 btn.innerHTML = '&#x21bb; Refresh';
