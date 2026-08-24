@@ -45,6 +45,18 @@ their own repository, on their own schedule.
 **Plugins run as root and are not reviewed by this project or by upstream.**
 Install only what you trust. `docs/plugins.md` is explicit about this.
 
+## Available plugins
+
+Plugins live in their own repositories, on their author's own release schedule.
+Install one from **Firmware Config → Plugins** using the `.tar.gz` URL and
+SHA256 published with its release.
+
+- **[Schedule Print](https://github.com/Chachigo/snapmaker-u1-schedule-print)**
+  — start a print job at a chosen time.
+
+Written one? [Writing a Plugin](docs/plugin_development.md) covers the layout,
+the manifest and publishing. Open an issue to have it listed here.
+
 ## Install
 
 Download the `.bin` from [Releases](../../releases), put it on a FAT32 USB
