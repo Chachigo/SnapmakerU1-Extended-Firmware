@@ -1,76 +1,104 @@
-# Custom Snapmaker U1 Firmware
+# Snapmaker U1 Extended Firmware — Community Plugins
 
-[![Latest Release](https://img.shields.io/github/v/release/paxx12/SnapmakerU1)](https://github.com/paxx12/SnapmakerU1/releases/latest)
-[![Pre-release](https://img.shields.io/github/v/release/paxx12/SnapmakerU1?include_prereleases&label=pre-release)](https://github.com/paxx12/SnapmakerU1/releases)
+The [Snapmaker U1 Extended Firmware](https://github.com/paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware),
+unchanged, plus one addition: **community plugins**.
 
-This project builds custom firmware for the Snapmaker U1 3D printer,
-enabling debug features like SSH access and adding additional capabilities.
+A plugin is a firmware feature you install on a printer that is already
+flashed — no rebuild, no reflash, from the author's own repository. It lets
+people publish features that don't belong in an official release but that
+others still want.
 
-This is an independent project and is not affiliated with Snapmaker.
+This is a fork. Everything else — the camera stack, Fluidd and Mainsail, RFID,
+Spoolman, the VPN and cloud integrations, Klipper tweaks — is the upstream
+project's work and behaves exactly as it does there.
 
-> **Warning**: While installing custom firmware does not automatically void the product warranty, any damage caused by or attributable to the installation or use of custom firmware is not covered under warranty. Use at your own risk. See [Snapmaker Terms of Use](https://www.snapmaker.com/terms-of-use) for details.
+> **Not affiliated with Snapmaker.** Neither is the upstream project.
 >
-> Custom firmware is intended for users with appropriate technical knowledge. Ensure you understand the implications before proceeding.
+> **Warning**: While installing custom firmware does not automatically void the
+> product warranty, any damage caused by or attributable to the installation or
+> use of custom firmware is not covered under warranty. Use at your own risk.
+> See [Snapmaker Terms of Use](https://www.snapmaker.com/terms-of-use).
+>
+> If you hit a problem, reproduce it on stock firmware before contacting
+> Snapmaker support. Report it here, not to upstream, unless you can reproduce
+> it on an unmodified upstream build.
 
-## Download
+## What this fork adds
 
-Get the latest pre-built firmware from [Releases](https://github.com/paxx12/SnapmakerU1/releases).
+A runtime plugin manager. Nothing else.
 
-## Documentation
+- Install a plugin from a URL or by uploading a `.tar.gz`, from
+  **Firmware Config → Plugins**, or over SSH with `extended-plugin`.
+- Enable, disable and remove plugins without rebuilding the firmware.
+- Optional SHA256 verification of what you download.
+- Plugins survive reboots and firmware upgrades; they live on the persistent
+  `/oem` partition and are re-applied at each boot.
 
-See [User Documentation](https://snapmakeru1-extended-firmware.pages.dev/) for features, installation instructions, and usage guides.
+A plugin uses the same layout an overlay does, so an existing
+[mod](docs/mods.md) becomes a plugin by adding one file. Authors publish from
+their own repository, on their own schedule.
 
-## Building from Source
+- [Plugins](docs/plugins.md) — installing, troubleshooting, the security model
+- [Writing a Plugin](docs/plugin_development.md) — the six extension points,
+  the manifest, packaging and publishing
 
-**Source repositories:**
-- GitHub: [https://github.com/paxx12](https://github.com/paxx12)
-- Codeberg: [https://codeberg.org/paxx12-snapmaker-u1](https://codeberg.org/paxx12-snapmaker-u1)
+**Plugins run as root and are not reviewed by this project or by upstream.**
+Install only what you trust. `docs/plugins.md` is explicit about this.
 
-See [Building from Source](docs/development.md) for instructions on building custom firmware using Docker.
+## Install
 
-## Dependent projects
+Download the `.bin` from [Releases](../../releases), put it on a FAT32 USB
+stick, then on the printer: `Settings` → `About` → `Firmware Version` →
+`Local Update`.
 
-- [v4l2-mpp](https://github.com/paxx12/v4l2-mpp) - Hardware-accelerated camera stack with WebRTC streaming, V4L2 controls, and settings persistence
-- [screen-apps](https://github.com/paxx12/screen-apps) - U1 touchscreen applications and UI components
-- [prometheus-klipper-exporter](https://github.com/scross01/prometheus-klipper-exporter) - Prometheus metrics exporter for Klipper
-- [snapmaker-u1-timelapse-recovery](https://github.com/horzadome/snapmaker-u1-timelapse-recovery) - Tool to recover corrupted timelapse videos
-- [rockchip-linux/kernel](https://github.com/rockchip-linux/kernel) - Rockchip kernel source for building additional kernel modules
+See the upstream [Installation Guide](docs/install.md) for the full procedure,
+and [Recovery](docs/firmware_config.md) if something goes wrong.
 
-## Community
+To go back, flash any build from
+[upstream's releases](https://github.com/paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware/releases)
+or the stock firmware from the
+[Snapmaker U1 Wiki](https://wiki.snapmaker.com/en/snapmaker_u1/firmware/release_notes).
+Your installed plugins stay in `/oem/plugins/` across a reflash; remove that
+directory to be rid of them.
 
-Join the [Snapmaker Discord](https://discord.com/invite/snapmaker-official-1086575708903571536) and visit the **#u1-printer** channel to connect with other users using the custom firmware, share experiences, and get help.
+## Build from source
 
-## Issues
+Identical to upstream — the plugin manager is a normal overlay under
+`overlays/firmware-extended/`, included in every build:
 
-For bug reports, please validate the issue against Stock Firmware first before creating a bug report. This helps determine if the issue is specific to the custom firmware or exists in the stock firmware as well.
+```bash
+./dev.sh make build PROFILE=extended
+```
 
-This repository does not accept feature requests or support issues in general. Pull Requests are the desired way to propose new changes and may be accepted after review.
+See [Building from Source](docs/development.md).
 
-## Contact
+## Relationship to upstream
 
-For inquiries about the firmware, contact: paxx12dev@gmail.com
+This fork tracks the upstream project's releases and re-applies the plugin
+manager on top. It is not a rewrite and not a competitor: if upstream adopts
+the feature, this fork has no reason to exist and will be retired.
 
-## Support
+Changes are kept to one commit against a clean upstream branch, so the
+difference stays reviewable and easy to rebase. To see exactly what is added:
 
-If you find this project useful and would like to support its development:
+```bash
+git remote add upstream https://github.com/paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware
+git fetch upstream
+git diff upstream/develop...HEAD
+```
 
-[![Buy Me A Coffee](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/paxx12)
+Bugs in the plugin manager belong here. Everything else belongs
+[upstream](https://github.com/paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware/issues).
 
-🖨️ **Buy a Snapmaker U1** — ordering via the link below supports this project. Optionally use code `PAXX12CUSTOM` for $20 off, or any other discount you find online:
+## Credits
 
-  * EU store: [https://snapmaker-eu.myshopify.com?ref=paxx12](https://snapmaker-eu.myshopify.com?ref=paxx12)
-  * US store: [https://snapmaker-us.myshopify.com?ref=paxx12](https://snapmaker-us.myshopify.com?ref=paxx12)
-  * Global store: [https://test-snapmaker.myshopify.com?ref=paxx12](https://test-snapmaker.myshopify.com?ref=paxx12)
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for information about contributing to this project.
-
-See [HEROES.md](HEROES.md) for contributors who made significant contributions to each release.
+All of the firmware is [paxx12](https://github.com/paxx12)'s work and that of
+its [contributors](HEROES.md). This fork adds one feature and takes credit for
+nothing else. If you find the firmware useful,
+[support the upstream project](https://buymeacoffee.com/paxx12).
 
 ## License
 
-The main project is licensed under the GNU General Public License v3.0
-(GPL-3.0). See [LICENSE](LICENSE) for details.
-
-For licensing information about individual tools and dependencies, see their respective directories.
+GPL-3.0, as upstream. See [LICENSE](LICENSE). Modified from the upstream
+project in August 2026; the modification is the community plugin manager
+described above, and its full source is in this repository.
