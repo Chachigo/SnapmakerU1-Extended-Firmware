@@ -1,0 +1,553 @@
+#!/usr/bin/env bash
+
+#
+# Manager for community plugins installed at runtime into `/oem/plugins`.
+#
+# A plugin is the same `root/` tree an overlay ships, packed as a tarball:
+# every extension point in this firmware (moonraker component, moonraker cfg,
+# nginx fluidd.d snippet, firmware-config function YAML, service hook, web
+# page) is a file drop, so a plugin needs no registry — just its files put in
+# the right place.
+#
+# The rootfs is an overlayfs whose upper is wiped on every boot unless
+# `/oem/.debug` exists, so `/oem/plugins` is the source of truth and `apply`
+# re-copies the trees into the live rootfs at each boot, from
+# `/etc/init.d/S48zextended-plugins`.
+#
+# Usage: extended-plugin install <url|file> [sha256]
+#        extended-plugin update <name>
+#        extended-plugin remove <name>
+#        extended-plugin enable|disable <name>
+#        extended-plugin list [--json]
+#        extended-plugin apply
+#
+# Plugins declare themselves in `plugin.conf`, sourced as shell:
+#
+#   PLUGIN_NAME          Required. [a-z0-9][a-z0-9._-]*
+#   PLUGIN_VERSION       Required.
+#   PLUGIN_LABEL         Human-readable name (default: $PLUGIN_NAME)
+#   PLUGIN_AUTHOR        Free text.
+#   PLUGIN_URL           Homepage.
+#   PLUGIN_PAGE          Path of the page the plugin serves on the printer,
+#                        e.g. /ntfy/. Linked from the plugin list.
+#   PLUGIN_DESCRIPTION   One line.
+#   PLUGIN_MIN_FIRMWARE  Minimum firmware version, checked against
+#                        /etc/BUILD_VERSION when that is a release build.
+#   PLUGIN_SERVICES      Init scripts restarted after install/remove/toggle,
+#                        e.g. "S50nginx S61moonraker".
+#
+# An optional executable `install.sh` next to it runs once, as root, after the
+# files are unpacked but before they are applied — for a pip dependency or a
+# venv. Returning non-zero fails the install.
+#
+
+set -u
+
+PLUGIN_ROOT="${PLUGIN_ROOT:-/oem/plugins}"
+PLUGIN_PREFIX="${PLUGIN_PREFIX:-}"
+CURL="${CURL:-/usr/local/bin/curl}"
+VERSION_FILE="${VERSION_FILE:-/etc/BUILD_VERSION}"
+EXTENDED_CONFIG_DIR="${EXTENDED_CONFIG_DIR:-/home/lava/printer_data/config/extended}"
+INITD_DIR="${INITD_DIR:-/etc/init.d}"
+
+# Relative path, inside a plugin's `root/`, of the config defaults that
+# S49extended-config copies into the user's config directory. Removing a
+# plugin has to clean up that copy too, since S49 knows nothing about plugins.
+DEFAULTS_REL="usr/local/share/firmware-config/extended"
+
+NAME_RE='^[a-z0-9][a-z0-9._-]*$'
+
+usage() {
+    sed -n '/^# Usage:/,/^#$/p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+log() { echo "$*"; }
+warn() { echo "WARNING: $*" >&2; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# --- manifest ---------------------------------------------------------------
+
+# Load `<dir>/plugin.conf` into the PLUGIN_* variables, resetting the optional
+# ones first so a previous plugin's values never leak into this one.
+load_manifest() {
+    local dir=$1
+
+    PLUGIN_NAME=""
+    PLUGIN_VERSION=""
+    PLUGIN_LABEL=""
+    PLUGIN_AUTHOR=""
+    PLUGIN_URL=""
+    PLUGIN_PAGE=""
+    PLUGIN_DESCRIPTION=""
+    PLUGIN_MIN_FIRMWARE=""
+    PLUGIN_SERVICES=""
+
+    [[ -f "$dir/plugin.conf" ]] || { warn "$dir has no plugin.conf"; return 1; }
+
+    # shellcheck disable=SC1090
+    source "$dir/plugin.conf" || { warn "$dir/plugin.conf failed to load"; return 1; }
+
+    [[ -n "$PLUGIN_NAME" ]] || { warn "$dir/plugin.conf does not set PLUGIN_NAME"; return 1; }
+    [[ -n "$PLUGIN_VERSION" ]] || { warn "$dir/plugin.conf does not set PLUGIN_VERSION"; return 1; }
+    [[ "$PLUGIN_NAME" =~ $NAME_RE ]] || { warn "invalid PLUGIN_NAME '$PLUGIN_NAME'"; return 1; }
+
+    PLUGIN_LABEL="${PLUGIN_LABEL:-$PLUGIN_NAME}"
+    return 0
+}
+
+# `/etc/BUILD_VERSION` is a git-describe string: `0.9.0-paxx12-1-gabcdef0` on a
+# release, `<branch>-<abbrev>` on a dev build. Only the first form is
+# comparable, so dev builds skip the check rather than guess.
+firmware_too_old() {
+    local want=$1 have
+
+    [[ -n "$want" ]] || return 1
+    [[ -r "$VERSION_FILE" ]] || return 1
+
+    have=$(head -n1 "$VERSION_FILE")
+    have=${have%%-*}
+    [[ "$have" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+
+    [[ "$(printf '%s\n%s\n' "$want" "$have" | sort -V | head -n1)" != "$want" ]]
+}
+
+# --- applying ---------------------------------------------------------------
+
+# Relative paths of every file and symlink under a directory. `find` on the
+# printer is busybox, which has no `-printf`, so the leading `./` is stripped
+# with sed instead.
+list_tree() {
+    ( cd "$1" && find . \( -type f -o -type l \) | sed 's|^\./||' | sort )
+}
+
+# Absolute paths recorded in `.files` are the authority on what a plugin owns,
+# both for removing it cleanly and for refusing to clobber someone else's file.
+#
+# ponytail: linear scan of every plugin's .files per applied path. A handful of
+# plugins with a handful of files each makes this free; build an index if the
+# boot-time apply ever shows up in the boot timings.
+owner_of() {
+    local target=$1 dir owner
+    for dir in "$PLUGIN_ROOT"/*/; do
+        [[ -f "$dir.files" ]] || continue
+        if grep -qxF "$target" "$dir.files"; then
+            owner=${dir%/}
+            echo "${owner##*/}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Copy this plugin's config defaults into the user's config directory, the way
+# S49extended-config does at boot. Without this, a plugin installed at runtime
+# ships a moonraker .cfg that nothing includes until the next reboot — and the
+# firmware-config toggle's `extended-config.py uncomment` finds no file, so its
+# `&&` chain never reaches the Moonraker restart.
+#
+# The mirror image of remove_config_copies.
+sync_config_defaults() {
+    local dir=$1 rel copy copied=0
+
+    [[ -d "$dir/root/$DEFAULTS_REL" ]] || return 0
+
+    while IFS= read -r rel; do
+        copy="$EXTENDED_CONFIG_DIR/$rel"
+        [[ -e "$copy" ]] && continue          # never clobber a user's edit, like cp -rn
+        mkdir -p "$(dirname "$copy")" || continue
+        cp "$dir/root/$DEFAULTS_REL/$rel" "$copy" || continue
+        copied=1
+        log "Installed default $copy"
+    done < <(list_tree "$dir/root/$DEFAULTS_REL")
+
+    # extended-plugin runs as root, Moonraker as lava — the last thing S49 does.
+    if [[ $copied -eq 1 ]]; then
+        chown -R lava:lava "$EXTENDED_CONFIG_DIR" 2>/dev/null ||
+            warn "could not set ownership of $EXTENDED_CONFIG_DIR to lava"
+    fi
+    return 0
+}
+
+# Copy `<dir>/root/**` into the live rootfs, recording every path written.
+# Files are copied rather than symlinked: S49extended-config prunes broken
+# symlinks and copies with `cp -rn`, so a symlinked .cfg would end up being
+# edited inside the plugin directory instead of the user's config.
+apply_plugin() {
+    # `local` declares every name before running the assignments, so a later
+    # one cannot read an earlier one on the same line under `set -u`.
+    local dir=$1 name=$2
+    local src="$dir/root"
+    local rel target owner failed=0
+
+    [[ -d "$src" ]] || { warn "$name has no root/ directory"; return 1; }
+
+    local staged="$dir/.files.new"
+    : > "$staged"
+
+    while IFS= read -r rel; do
+        target="$PLUGIN_PREFIX/$rel"
+
+        if [[ -e "$target" ]]; then
+            owner=$(owner_of "$target") || owner=""
+            if [[ -z "$owner" ]]; then
+                warn "$name: refusing to overwrite firmware file $target"
+                failed=1
+                continue
+            elif [[ "$owner" != "$name" ]]; then
+                warn "$name: $target is already owned by plugin '$owner', skipping"
+                failed=1
+                continue
+            fi
+        fi
+
+        mkdir -p "$(dirname "$target")" || { failed=1; continue; }
+        cp -a "$src/$rel" "$target" || { failed=1; continue; }
+        echo "$target" >> "$staged"
+    done < <(list_tree "$src")
+
+    # Drop anything the previous apply left behind that this one no longer
+    # writes, then swap the manifest in.
+    if [[ -f "$dir/.files" ]]; then
+        while IFS= read -r target; do
+            grep -qxF "$target" "$staged" || remove_file "$target"
+        done < "$dir/.files"
+    fi
+    mv "$staged" "$dir/.files"
+
+    sync_config_defaults "$dir"
+
+    return $failed
+}
+
+# Drop directories a plugin left empty, stopping at the first non-empty one and
+# never climbing past $PLUGIN_PREFIX. In practice every firmware directory a
+# plugin drops into already holds other files, so only directories the plugin
+# itself created ever get removed.
+prune_dirs() {
+    local dir=$1
+    while [[ -n "$dir" && "$dir" != "/" && "$dir" != "$PLUGIN_PREFIX" ]]; do
+        rmdir "$dir" 2>/dev/null || return 0
+        dir=$(dirname "$dir")
+    done
+}
+
+remove_file() {
+    local target=$1
+    [[ -e "$target" || -L "$target" ]] || return 0
+    rm -f "$target"
+    prune_dirs "$(dirname "$target")"
+    return 0
+}
+
+unapply_plugin() {
+    local dir=$1 target
+
+    [[ -f "$dir/.files" ]] || return 0
+    while IFS= read -r target; do
+        remove_file "$target"
+    done < "$dir/.files"
+    rm -f "$dir/.files"
+}
+
+restart_services() {
+    local svc action
+
+    for svc in ${PLUGIN_SERVICES:-}; do
+        # nginx is reloaded, never restarted. extended-plugin usually runs from
+        # a firmware-config request served *through* nginx, and `restart` is a
+        # stop/start that would kill the very connection streaming this output —
+        # the install succeeds but reports itself as a failure. `nginx -s reload`
+        # picks up a new fluidd.d/*.conf and leaves open connections alone.
+        action=restart
+        [[ "$svc" == *nginx* ]] && action=reload
+
+        if [[ -x "$INITD_DIR/$svc" ]]; then
+            log "Running $svc $action..."
+            "$INITD_DIR/$svc" "$action"
+        else
+            warn "no such init script: $svc"
+        fi
+    done
+
+    reload_firmware_config
+}
+
+# firmware-config reads functions/*.yaml only at startup, so a plugin that ships
+# one — a settings toggle, a quick link — stays invisible until it is restarted.
+# Every plugin may use that slot, so this is not left to PLUGIN_SERVICES.
+#
+# When firmware-config is itself the caller it sets EXTENDED_PLUGIN_CALLER and
+# reloads its own functions in-process: restarting it here would kill the
+# response streaming this output.
+reload_firmware_config() {
+    [[ -z "${EXTENDED_PLUGIN_CALLER:-}" ]] || return 0
+    [[ -x "$INITD_DIR/S99firmware-config" ]] || return 0
+
+    log "Restarting firmware-config to pick up plugin settings..."
+    "$INITD_DIR/S99firmware-config" restart
+}
+
+plugin_dir() {
+    local name=$1
+    [[ "$name" =~ $NAME_RE ]] || die "invalid plugin name '$name'"
+    [[ -d "$PLUGIN_ROOT/$name" ]] || die "plugin '$name' is not installed"
+    echo "$PLUGIN_ROOT/$name"
+}
+
+# --- commands ---------------------------------------------------------------
+
+cmd_apply() {
+    local dir name
+
+    for flag in /mnt/udisk/plugins-disable.txt /mnt/udisk/plugins-disable.txt.txt; do
+        if [[ -f "$flag" ]]; then
+            log "$flag present: all plugins disabled for this boot."
+            return 0
+        fi
+    done
+
+    for dir in "$PLUGIN_ROOT"/*/; do
+        [[ -d "$dir" ]] || continue
+        dir=${dir%/}
+        name=${dir##*/}
+
+        # A broken third-party plugin must never stop the printer from booting,
+        # so every plugin is handled in a subshell and failures only get logged.
+        (
+            if [[ -f "$dir/.disabled" ]]; then
+                unapply_plugin "$dir"
+                exit 0
+            fi
+            load_manifest "$dir" || { unapply_plugin "$dir"; exit 1; }
+            if firmware_too_old "$PLUGIN_MIN_FIRMWARE"; then
+                warn "$name needs firmware >= $PLUGIN_MIN_FIRMWARE, skipping"
+                unapply_plugin "$dir"
+                exit 0
+            fi
+            apply_plugin "$dir" "$name" || exit 1
+            log "Applied $name $PLUGIN_VERSION"
+        ) || warn "$name failed to apply"
+    done
+
+    return 0
+}
+
+cmd_install() {
+    local src=$1 want_sha=${2:-} archive actual staging top
+
+    local tmp="$PLUGIN_ROOT/.tmp"
+    rm -rf "$tmp"
+    mkdir -p "$tmp" || die "cannot write to $PLUGIN_ROOT"
+
+    archive="$tmp/plugin.tar.gz"
+    case "$src" in
+        http://*|https://*)
+            log "Downloading $src..."
+            "$CURL" -fSL -o "$archive" "$src" || { rm -rf "$tmp"; die "download failed"; }
+            ;;
+        *)
+            [[ -f "$src" ]] || { rm -rf "$tmp"; die "no such file: $src"; }
+            cp "$src" "$archive" || { rm -rf "$tmp"; die "cannot read $src"; }
+            ;;
+    esac
+
+    actual=$(sha256sum "$archive" | cut -d' ' -f1)
+    if [[ -n "$want_sha" ]]; then
+        if [[ "$actual" != "$want_sha" ]]; then
+            rm -rf "$tmp"
+            die "checksum mismatch: expected $want_sha, got $actual"
+        fi
+        log "Checksum verified."
+    else
+        log "SHA256: $actual"
+        log "No checksum given — this archive was not verified."
+    fi
+
+    staging="$tmp/unpack"
+    mkdir -p "$staging"
+    tar -xzf "$archive" -C "$staging" || { rm -rf "$tmp"; die "extraction failed"; }
+    rm -f "$archive"
+
+    # Accept both a tarball of the plugin directory and one of its contents.
+    if [[ ! -f "$staging/plugin.conf" ]]; then
+        top=("$staging"/*)
+        if [[ ${#top[@]} -eq 1 && -d "${top[0]}" ]]; then
+            staging=${top[0]}
+        fi
+    fi
+
+    load_manifest "$staging" || { rm -rf "$tmp"; die "invalid plugin archive"; }
+
+    if firmware_too_old "$PLUGIN_MIN_FIRMWARE"; then
+        rm -rf "$tmp"
+        die "$PLUGIN_LABEL needs firmware >= $PLUGIN_MIN_FIRMWARE (this build: $(head -n1 "$VERSION_FILE" 2>/dev/null))"
+    fi
+
+    local dest="$PLUGIN_ROOT/$PLUGIN_NAME"
+    local disabled=""
+    if [[ -d "$dest" ]]; then
+        log "Replacing existing $PLUGIN_NAME..."
+        [[ -f "$dest/.disabled" ]] && disabled=1
+        unapply_plugin "$dest"
+        rm -rf "$dest"
+    fi
+
+    mv "$staging" "$dest" || { rm -rf "$tmp"; die "install failed"; }
+    rm -rf "$tmp"
+    [[ -n "$disabled" ]] && touch "$dest/.disabled"
+
+    case "$src" in
+        http://*|https://*) echo "$src" > "$dest/.source" ;;
+    esac
+
+    if [[ -x "$dest/install.sh" ]]; then
+        log "Running install.sh..."
+        if ! ( cd "$dest" && ./install.sh ); then
+            rm -rf "$dest"
+            die "install.sh failed"
+        fi
+    fi
+
+    if [[ -z "$disabled" ]]; then
+        apply_plugin "$dest" "$PLUGIN_NAME" || warn "some files could not be applied"
+        restart_services
+    fi
+
+    log "$PLUGIN_LABEL $PLUGIN_VERSION installed."
+    [[ -n "$disabled" ]] && log "Plugin is disabled; run 'extended-plugin enable $PLUGIN_NAME' to activate it."
+    return 0
+}
+
+cmd_update() {
+    local dir source
+    dir=$(plugin_dir "$1")
+    [[ -f "$dir/.source" ]] || die "plugin '$1' was installed from a file, reinstall it manually"
+    source=$(head -n1 "$dir/.source")
+    log "Reinstalling from $source"
+    cmd_install "$source"
+}
+
+# Remove the copies of this plugin's config defaults, whether they were made by
+# S49extended-config at boot or by sync_config_defaults at install, along with
+# the `.default` reference files S49 derives from them.
+remove_config_copies() {
+    local dir=$1 rel copy candidate
+
+    [[ -d "$dir/root/$DEFAULTS_REL" ]] || return 0
+    [[ -d "$EXTENDED_CONFIG_DIR" ]] || return 0
+
+    while IFS= read -r rel; do
+        copy="$EXTENDED_CONFIG_DIR/$rel"
+        for candidate in "$copy" "$copy.default"; do
+            if [[ -f "$candidate" ]]; then
+                rm -f "$candidate"
+                log "Removed $candidate"
+                prune_dirs "$(dirname "$candidate")"
+            fi
+        done
+    done < <(list_tree "$dir/root/$DEFAULTS_REL")
+}
+
+cmd_remove() {
+    local dir name=$1
+    dir=$(plugin_dir "$name")
+    load_manifest "$dir" || PLUGIN_SERVICES=""
+
+    unapply_plugin "$dir"
+    remove_config_copies "$dir"
+    rm -rf "$dir"
+    restart_services
+    log "Removed $name."
+}
+
+cmd_toggle() {
+    local action=$1 dir name=$2
+    dir=$(plugin_dir "$name")
+    load_manifest "$dir" || die "plugin '$name' has an invalid plugin.conf"
+
+    if [[ "$action" == disable ]]; then
+        touch "$dir/.disabled"
+        unapply_plugin "$dir"
+        log "Disabled $name."
+    else
+        rm -f "$dir/.disabled"
+        apply_plugin "$dir" "$name" || warn "some files could not be applied"
+        log "Enabled $name."
+    fi
+    restart_services
+}
+
+json_escape() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/ }
+    s=${s//$'\t'/ }
+    printf '%s' "$s"
+}
+
+cmd_list() {
+    local as_json=0 dir name state first=1
+    [[ "${1:-}" == "--json" ]] && as_json=1
+
+    [[ $as_json -eq 1 ]] && printf '['
+
+    for dir in "$PLUGIN_ROOT"/*/; do
+        [[ -d "$dir" ]] || continue
+        dir=${dir%/}
+        name=${dir##*/}
+
+        if [[ -f "$dir/.disabled" ]]; then
+            state=disabled
+        elif [[ -f "$dir/.files" ]]; then
+            state=enabled
+        else
+            state=error
+        fi
+
+        if ! load_manifest "$dir" 2>/dev/null; then
+            PLUGIN_NAME=$name
+            PLUGIN_LABEL=$name
+            PLUGIN_VERSION="?"
+            PLUGIN_PAGE=""
+            state=error
+        fi
+
+        if [[ $as_json -eq 1 ]]; then
+            [[ $first -eq 1 ]] || printf ','
+            first=0
+            printf '{"name":"%s","label":"%s","version":"%s","author":"%s","url":"%s","page":"%s","description":"%s","state":"%s"}' \
+                "$(json_escape "$name")" \
+                "$(json_escape "$PLUGIN_LABEL")" \
+                "$(json_escape "$PLUGIN_VERSION")" \
+                "$(json_escape "$PLUGIN_AUTHOR")" \
+                "$(json_escape "$PLUGIN_URL")" \
+                "$(json_escape "$PLUGIN_PAGE")" \
+                "$(json_escape "$PLUGIN_DESCRIPTION")" \
+                "$state"
+        else
+            printf '%-24s %-12s %-9s %s\n' "$name" "$PLUGIN_VERSION" "$state" "$PLUGIN_LABEL"
+        fi
+    done
+
+    [[ $as_json -eq 1 ]] && printf ']\n'
+    return 0
+}
+
+mkdir -p "$PLUGIN_ROOT" 2>/dev/null
+
+[[ $# -ge 1 ]] || usage
+COMMAND=$1
+shift
+
+case "$COMMAND" in
+    apply)   cmd_apply ;;
+    install) [[ $# -ge 1 ]] || usage; cmd_install "$@" ;;
+    update)  [[ $# -eq 1 ]] || usage; cmd_update "$1" ;;
+    remove)  [[ $# -eq 1 ]] || usage; cmd_remove "$1" ;;
+    enable)  [[ $# -eq 1 ]] || usage; cmd_toggle enable "$1" ;;
+    disable) [[ $# -eq 1 ]] || usage; cmd_toggle disable "$1" ;;
+    list)    cmd_list "$@" ;;
+    *)       usage ;;
+esac

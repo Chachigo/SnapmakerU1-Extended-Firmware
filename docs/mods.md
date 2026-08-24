@@ -9,6 +9,11 @@ aren't part of the maintained `firmware-extended` build. It exists so people
 who maintain their own fork or feature set can capture that work as a single
 composable overlay directory instead of carrying a whole separate fork.
 
+A mod is applied at build time, so using one means building the firmware from
+source. To hand a feature to someone who only ever flashes releases, package it
+as a [plugin](plugins.md) instead — same `root/` layout, plus a `plugin.conf`,
+so one directory can be both. See [Writing a Plugin](plugin_development.md).
+
 ## Naming
 
 Name your mod directory after your GitHub username, not after the feature
@@ -121,6 +126,7 @@ file, which belongs in `root/` instead.
 - Mods are not guaranteed to work together. If combining two mods breaks
   something, that's for the mods involved to sort out, not this repo.
 - Mods do not ship in public releases. They only exist for people who build
-  their own firmware from source.
+  their own firmware from source. Adding a `plugin.conf` makes a mod
+  installable at runtime as well, without changing how it builds.
 - A mod that reaches decent maturity can be promoted into
   `overlays/firmware-extended/` through a normal PR.

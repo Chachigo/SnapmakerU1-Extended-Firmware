@@ -10,7 +10,7 @@ import time
 import fcntl
 import yaml
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 def deep_merge(base, override):
     """Deep merge override into base, modifying base in place."""
@@ -23,7 +23,7 @@ def deep_merge(base, override):
 
 def load_functions_from_dir(functions_dir):
     """Load and deep merge all YAML files from a directory in sorted order."""
-    config = {'links': {}, 'settings': {}, 'actions': {}, 'quick_actions': {}, 'status': {}, 'upgrade_url': {}, 'upgrade_upload': {}}
+    config = {'links': {}, 'settings': {}, 'actions': {}, 'quick_actions': {}, 'status': {}, 'upgrade_url': {}, 'upgrade_upload': {}, 'plugin_install_url': {}, 'plugin_install_upload': {}}
 
     if not os.path.isdir(functions_dir):
         log(f"Functions directory not found: {functions_dir}")
@@ -49,6 +49,32 @@ def log(msg):
     ts = time.strftime('%H:%M:%S')
     print(f"[{ts}] {msg}", flush=True)
 
+PLUGIN_MANAGER = "/usr/local/bin/extended-plugin"
+
+PLUGIN_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
+ENV_FIELD_RE = re.compile(r'^[A-Z][A-Z0-9_]*$')
+
+def plugin_env(base=None):
+    """Environment for extended-plugin when this daemon is the caller.
+
+    The marker tells extended-plugin not to restart firmware-config: that would
+    kill the response streaming its output, and reload_functions() covers it.
+    """
+    return {**(base or os.environ), "EXTENDED_PLUGIN_CALLER": "firmware-config"}
+
+def query_env(path):
+    """Extra environment for a shell template, taken from the query string.
+
+    Only SHOUTING_CASE keys are accepted, so a caller cannot smuggle in PATH or
+    LD_PRELOAD. Used for optional arguments a shell template wants beside its
+    positional one, e.g. PLUGIN_SHA256.
+    """
+    extra = {}
+    for key, values in parse_qs(urlparse(path).query).items():
+        if ENV_FIELD_RE.match(key) and values:
+            extra[key] = values[0]
+    return {**os.environ, **extra} if extra else None
+
 def shell_to_cmd(shell, *args):
     cmd = ["/bin/bash", "-c", shell]
     if args:
@@ -58,7 +84,8 @@ def shell_to_cmd(shell, *args):
 
 class FirmwareConfigHandler(SimpleHTTPRequestHandler):
     html_dir = None
-    functions = {'settings': {}, 'links': {}, 'actions': {}, 'quick_actions': {}, 'status': {}, 'upgrade_url': {}, 'upgrade_upload': {}}
+    functions_dir = None
+    functions = {'settings': {}, 'links': {}, 'actions': {}, 'quick_actions': {}, 'status': {}, 'upgrade_url': {}, 'upgrade_upload': {}, 'plugin_install_url': {}, 'plugin_install_upload': {}}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=self.html_dir, **kwargs)
@@ -78,15 +105,27 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
             self.handle_get_actions('quick_actions')
         elif path == "/api/actions":
             self.handle_get_actions('actions')
+        elif path == "/api/plugins":
+            self.handle_get_plugins()
         else:
             super().do_GET()
 
     def do_POST(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/upgrade/url":
-            self.handle_upgrade_url()
+            self.handle_shell_url('upgrade_url')
         elif parsed.path == "/api/upgrade/upload":
-            self.handle_upgrade_upload()
+            self.handle_shell_upload('upgrade_upload')
+        elif parsed.path == "/api/plugins/install/url":
+            self.handle_shell_url('plugin_install_url')
+        elif parsed.path == "/api/plugins/install/upload":
+            self.handle_shell_upload('plugin_install_upload')
+        elif parsed.path.startswith("/api/plugins/"):
+            path_parts = parsed.path[len("/api/plugins/"):].split('/')
+            if len(path_parts) == 2:
+                self.handle_plugin_command(path_parts[0], path_parts[1])
+            else:
+                self.send_error(404, "Invalid plugins path")
         elif parsed.path.startswith("/api/settings/"):
             path_parts = parsed.path[14:].split('/')
             if len(path_parts) == 2:
@@ -427,6 +466,52 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
             log(f"Get {key} error: {e}")
             self.send_error(500, str(e))
 
+    # A plugin ships its own functions/*.yaml, and this directory is otherwise
+    # only read at startup — so a freshly installed plugin's settings and quick
+    # links would not appear until a reboot. Restarting the daemon is not an
+    # option: it is the one streaming this very response.
+    def reload_functions(self):
+        if not self.functions_dir:
+            return
+        try:
+            FirmwareConfigHandler.functions = load_functions_from_dir(self.functions_dir)
+            log("Reloaded functions after plugin change")
+        except Exception as e:
+            log(f"Function reload failed: {e}")
+
+    def handle_get_plugins(self):
+        try:
+            result = subprocess.run([PLUGIN_MANAGER, "list", "--json"],
+                                    capture_output=True, text=True, timeout=15)
+            self.send_json(json.loads(result.stdout or "[]"))
+        except Exception as e:
+            log(f"Get plugins error: {e}")
+            self.send_error(500, str(e))
+
+    def handle_plugin_command(self, name, command):
+        if command not in ("enable", "disable", "remove", "update"):
+            self.send_error(404, f"Unknown plugin command: {command}")
+            return
+        if not PLUGIN_NAME_RE.match(name):
+            self.send_error(400, "Invalid plugin name")
+            return
+
+        try:
+            log(f"Plugin {command}: {name}")
+            self._start_text_stream()
+            self._write_stream_chunk(f"=== {command} {name} ===\n\n")
+            rc, _ = self._stream_command([PLUGIN_MANAGER, command, name], env=plugin_env())
+            self.reload_functions()
+            self._write_stream_chunk(f"\n{'=' * 40}\n")
+            if rc == 0:
+                self._write_stream_chunk("SUCCESS: Completed successfully.\n")
+            else:
+                self._write_stream_chunk(f"ERROR: Failed with exit code {rc}\n")
+            self._finish_text_stream()
+        except Exception as e:
+            log(f"Plugin {command} error: {e}")
+            self.send_error(500, str(e))
+
     def handle_update_setting(self, setting_key, value):
         stream_started = False
         try:
@@ -568,10 +653,13 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
                 pass
             raise
 
-    def handle_upgrade_url(self):
-        cfg = self.functions.get('upgrade_url', {})
+    # Runs a configured shell template against a user-supplied URL, streaming
+    # its output. `cfg_key` picks which top-level config block drives it, so
+    # firmware upgrades and plugin installs share one implementation.
+    def handle_shell_url(self, cfg_key):
+        cfg = self.functions.get(cfg_key, {})
         if not cfg:
-            self.send_error(404, "URL upgrade not configured")
+            self.send_error(404, f"{cfg_key} is not configured")
             return
 
         shell_template = cfg.get('shell')
@@ -596,15 +684,21 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
                 self.send_error(400, "Missing 'url' parameter")
                 return
 
-            log(f"Upgrade from URL: {url}")
+            log(f"{cfg_key}: {url}")
             self._start_text_stream()
             stream_started = True
-            self._write_stream_chunk(f"=== Upgrade Started ===\n")
+            self._write_stream_chunk(f"=== {cfg.get('title', cfg_key)} ===\n")
             self._write_stream_chunk(f"URL: {url}\n")
             self._write_stream_chunk(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             self._write_stream_chunk(f"{'=' * 40}\n\n")
 
-            rc, stopped = self._stream_command(shell_to_cmd(shell_template, url), stop_token=stop_token)
+            env = query_env(self.path)
+            if cfg.get("reload_functions"):
+                env = plugin_env(env)
+
+            rc, stopped = self._stream_command(shell_to_cmd(shell_template, url), stop_token=stop_token, env=env)
+            if cfg.get("reload_functions"):
+                self.reload_functions()
             self._write_stream_chunk(f"\n{'=' * 40}\n")
             if rc == 0 or stopped:
                 self._write_stream_chunk("SUCCESS: Completed successfully.\n")
@@ -612,7 +706,7 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
                 self._write_stream_chunk(f"ERROR: Failed with exit code {rc}\n")
             self._finish_text_stream()
         except Exception as e:
-            log(f"Upgrade URL error: {e}")
+            log(f"{cfg_key} error: {e}")
             try:
                 if stream_started:
                     self._write_stream_chunk(f"\nError: {e}\n")
@@ -622,10 +716,12 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
             except Exception:
                 pass
 
-    def handle_upgrade_upload(self):
-        cfg = self.functions.get('upgrade_upload', {})
+    # Same as handle_shell_url, but the argument is a multipart upload
+    # streamed to `upload_path` first.
+    def handle_shell_upload(self, cfg_key):
+        cfg = self.functions.get(cfg_key, {})
         if not cfg:
-            self.send_error(404, "Upload upgrade not configured")
+            self.send_error(404, f"{cfg_key} is not configured")
             return
 
         upload_path = cfg.get('upload_path', '/tmp/upload_file')
@@ -648,14 +744,20 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
             log(f"Uploaded: {file_path} ({file_size} bytes)")
             self._start_text_stream()
             stream_started = True
-            self._write_stream_chunk(f"=== Upgrade Started ===\n")
+            self._write_stream_chunk(f"=== {cfg.get('title', cfg_key)} ===\n")
             self._write_stream_chunk(f"File: {file_path}\n")
             self._write_stream_chunk(f"Size: {file_size} bytes\n")
             self._write_stream_chunk(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             self._write_stream_chunk(f"{'=' * 40}\n\n")
 
             try:
-                rc, stopped = self._stream_command(shell_to_cmd(shell_template, file_path), stop_token=stop_token)
+                env = query_env(self.path)
+                if cfg.get("reload_functions"):
+                    env = plugin_env(env)
+
+                rc, stopped = self._stream_command(shell_to_cmd(shell_template, file_path), stop_token=stop_token, env=env)
+                if cfg.get("reload_functions"):
+                    self.reload_functions()
                 self._write_stream_chunk(f"\n{'=' * 40}\n")
                 if rc == 0 or stopped:
                     self._write_stream_chunk("SUCCESS: Completed successfully.\n")
@@ -670,7 +772,7 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
                     pass
             self._finish_text_stream()
         except Exception as e:
-            log(f"Upgrade upload error: {e}")
+            log(f"{cfg_key} error: {e}")
             try:
                 if stream_started:
                     self._write_stream_chunk(f"\nError: {e}\n")
@@ -713,6 +815,7 @@ def main():
     functions = load_functions_from_dir(args.functions_dir)
 
     FirmwareConfigHandler.html_dir = os.fspath(args.html_dir)
+    FirmwareConfigHandler.functions_dir = args.functions_dir
     FirmwareConfigHandler.functions = functions
 
     server = ThreadingHTTPServer((args.bind, args.port), FirmwareConfigHandler)

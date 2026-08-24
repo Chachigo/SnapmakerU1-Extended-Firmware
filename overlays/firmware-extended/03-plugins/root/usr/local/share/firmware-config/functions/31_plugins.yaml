@@ -1,0 +1,15 @@
+# Install endpoints for the plugin manager. `shell` is run with the URL or the
+# uploaded file path as $1; PLUGIN_SHA256 comes from the optional checksum
+# field in the web UI.
+plugin_install_url:
+  title: Install Plugin (URL)
+  reload_functions: true
+  shell: |
+    /usr/local/bin/extended-plugin install "$1" "${PLUGIN_SHA256:-}"
+
+plugin_install_upload:
+  title: Install Plugin (Upload)
+  upload_path: /userdata/plugin-upload.tar.gz
+  reload_functions: true
+  shell: |
+    /usr/local/bin/extended-plugin install "$1" "${PLUGIN_SHA256:-}"

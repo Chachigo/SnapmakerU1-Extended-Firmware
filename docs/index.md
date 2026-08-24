@@ -47,6 +47,7 @@ Heavily expanded firmware with extensive features and customization:
 
 - [Firmware Configuration](firmware_config.md) - Customize firmware behavior via web interface or config file
 - [Fluidd or Mainsail](firmware_config.md#web) (selectable) - Choose your preferred web interface
+- [Plugins](plugins.md) - Install community features on a flashed printer, without rebuilding the firmware ([writing one](plugin_development.md))
 
 **Camera & Media:**
 
